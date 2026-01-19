@@ -1,12 +1,12 @@
 {
   "domain": "isone_grid_monitor",
   "name": "ISO-NE Grid Monitor",
-  "codeowners": ["@yourusername"],
+  "codeowners": ["@philbert2k"],
   "config_flow": true,
-  "documentation": "https://github.com/yourusername/isone_grid_monitor",
+  "documentation": "https://github.com/philbert2k/isone_grid_monitor",
   "integration_type": "hub",
   "iot_class": "cloud_polling",
-  "issue_tracker": "https://github.com/yourusername/isone_grid_monitor/issues",
+  "issue_tracker": "https://github.com/philbert2k/isone_grid_monitor/issues",
   "requirements": ["gridstatus>=0.30.0"],
   "version": "1.0.0"
 }
