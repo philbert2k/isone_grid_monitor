@@ -1,0 +1,18 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Configure ISO-NE Grid Monitor",
+        "description": "Set up monitoring for the ISO New England power grid",
+        "data": {
+          "monitor_systemwide": "Monitor System-wide Status",
+          "zone": "Specific Zone to Monitor",
+          "update_interval": "Update Interval (minutes)"
+        }
+      }
+    },
+    "error": {
+      "invalid_update_interval": "Update interval must be between 1 and 60 minutes"
+    }
+  }
+}
