@@ -1,0 +1,27 @@
+# Example Automations for ISO-NE Grid Monitor
+
+# Grid Emergency - Immediate notification
+automation:
+  - alias: "ISO-NE: Critical Grid Emergency"
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.isone_grid_monitor_grid_emergency
+        to: 'on'
+    action:
+      - service: notify.mobile_app_phone
+        data:
+          title: "🚨 GRID EMERGENCY - ISO-NE"
+          message: "{{ states('sensor.isone_grid_monitor_system_status') }}"
+          data:
+            priority: high
+
+  - alias: "ISO-NE: Power Warning Alert"
+    trigger:
+      - platform: numeric_state
+        entity_id: sensor.isone_grid_monitor_alert_level
+        above: 3
+    action:
+      - service: notify.mobile_app_phone
+        data:
+          title: "⚠️ Power Warning - ISO-NE"
+          message: "Alert Level: {{ states('sensor.isone_grid_monitor_alert_level') }}"

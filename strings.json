@@ -1,0 +1,42 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Configure ISO-NE Grid Monitor",
+        "description": "Set up monitoring for the ISO New England power grid",
+        "data": {
+          "monitor_systemwide": "Monitor System-wide Status",
+          "zone": "Specific Zone to Monitor",
+          "update_interval": "Update Interval (minutes)"
+        },
+        "data_description": {
+          "monitor_systemwide": "Monitor overall New England grid status",
+          "zone": "Select a specific load zone for detailed monitoring (New Hampshire, Maine, etc.)",
+          "update_interval": "How often to check for updates (1-60 minutes)"
+        }
+      }
+    },
+    "error": {
+      "invalid_update_interval": "Update interval must be between 1 and 60 minutes"
+    },
+    "abort": {
+      "already_configured": "This integration is already configured"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Configure ISO-NE Grid Monitor Options",
+        "description": "Update your monitoring preferences",
+        "data": {
+          "monitor_systemwide": "Monitor System-wide Status",
+          "zone": "Specific Zone to Monitor",
+          "update_interval": "Update Interval (minutes)"
+        }
+      }
+    },
+    "error": {
+      "invalid_update_interval": "Update interval must be between 1 and 60 minutes"
+    }
+  }
+}
