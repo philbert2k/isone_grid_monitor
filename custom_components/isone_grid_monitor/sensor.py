@@ -11,7 +11,7 @@ from homeassistant.components.sensor import (
     SensorStateClass,
 )
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import UnitOfPower
+from homeassistant.const import UnitOfPower, PERCENTAGE
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
@@ -52,10 +52,10 @@ async def async_setup_entry(
         ISONESystemStatusSensor(coordinator, entry),
         ISONEAlertLevelSensor(coordinator, entry),
         ISONETotalLoadSensor(coordinator, entry),
+        ISONEOP4ActionSensor(coordinator, entry),
+        ISONESystemCapacitySensor(coordinator, entry),
+        ISONECapacityMarginSensor(coordinator, entry),
     ]
-    
-    # Add OP-4 action sensor
-    sensors.append(ISONEOP4ActionSensor(coordinator, entry))
     
     # Add zone-specific load sensor if zone is selected
     if zone and zone != "SYSTEM_WIDE":
@@ -82,7 +82,7 @@ class ISONEBaseSensor(CoordinatorEntity, SensorEntity):
             "name": "ISO-NE Grid Monitor",
             "manufacturer": "ISO New England",
             "model": "Grid Status Monitor",
-            "sw_version": "1.0.0",
+            "sw_version": "1.0.1",
         }
 
 
@@ -205,13 +205,17 @@ class ISONEOP4ActionSensor(ISONEBaseSensor):
         self._attr_unique_id = f"{entry.entry_id}_op4_action"
 
     @property
-    def native_value(self) -> int | None:
-        """Return the current OP-4 action number."""
+    def native_value(self) -> str:
+        """Return the current OP-4 action status."""
         if not self.coordinator.data:
-            return None
+            return "None"
         
         parsed_status = self.coordinator.data.get("parsed_status", {})
-        return parsed_status.get("op4_action")
+        action_num = parsed_status.get("op4_action")
+        
+        if action_num:
+            return f"Action {action_num}"
+        return "None"
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
@@ -224,8 +228,12 @@ class ISONEOP4ActionSensor(ISONEBaseSensor):
         
         attrs = {}
         if action_num:
+            attrs["action_number"] = action_num
             attrs["action_description"] = OP4_ACTIONS.get(action_num, "Unknown action")
             attrs[ATTR_SEVERITY] = parsed_status.get("severity", 0)
+        else:
+            attrs["action_number"] = None
+            attrs["action_description"] = "No OP-4 action in effect"
         
         return attrs
 
@@ -268,6 +276,92 @@ class ISONETotalLoadSensor(ISONEBaseSensor):
         attrs = {}
         if load_data.get("timestamp"):
             attrs[ATTR_TIMESTAMP] = load_data["timestamp"]
+        
+        return attrs
+
+
+class ISONESystemCapacitySensor(ISONEBaseSensor):
+    """Sensor for ISO-NE system capacity."""
+
+    _attr_name = "System Capacity"
+    _attr_device_class = SensorDeviceClass.POWER
+    _attr_native_unit_of_measurement = UnitOfPower.MEGA_WATT
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_icon = "mdi:transmission-tower-export"
+
+    def __init__(
+        self,
+        coordinator: ISONEDataCoordinator,
+        entry: ConfigEntry,
+    ) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator, entry)
+        self._attr_unique_id = f"{entry.entry_id}_system_capacity"
+
+    @property
+    def native_value(self) -> float | None:
+        """Return the system capacity in MW."""
+        if not self.coordinator.data:
+            return None
+        
+        return self.coordinator.data.get("capacity")
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return the state attributes."""
+        attrs = {
+            "description": "Available generation capacity",
+            "source": "ISO-NE 7-day forecast"
+        }
+        
+        if self.coordinator.last_capacity_update:
+            attrs["last_updated"] = self.coordinator.last_capacity_update.isoformat()
+        
+        return attrs
+
+
+class ISONECapacityMarginSensor(ISONEBaseSensor):
+    """Sensor for ISO-NE capacity margin percentage."""
+
+    _attr_name = "Capacity Margin"
+    _attr_native_unit_of_measurement = PERCENTAGE
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_icon = "mdi:gauge"
+
+    def __init__(
+        self,
+        coordinator: ISONEDataCoordinator,
+        entry: ConfigEntry,
+    ) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator, entry)
+        self._attr_unique_id = f"{entry.entry_id}_capacity_margin"
+
+    @property
+    def native_value(self) -> float | None:
+        """Return the capacity margin percentage."""
+        if not self.coordinator.data:
+            return None
+        
+        return self.coordinator.data.get("capacity_margin")
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return the state attributes."""
+        if not self.coordinator.data:
+            return {}
+        
+        capacity = self.coordinator.data.get("capacity")
+        load = self.coordinator.data.get("load", {}).get("total_load")
+        
+        attrs = {
+            "description": "Available capacity headroom"
+        }
+        
+        if capacity and load:
+            attrs["available_mw"] = round(capacity - load, 1)
+            attrs["capacity_mw"] = round(capacity, 1)
+            attrs["load_mw"] = round(load, 1)
         
         return attrs
 

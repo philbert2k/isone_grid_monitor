@@ -1,9 +1,12 @@
 """Data coordinator for ISO-NE Grid Monitor."""
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 import logging
 from typing import Any
+import aiohttp
+import pandas as pd
+import io
 
 import gridstatus
 from gridstatus import ISONE
@@ -19,6 +22,7 @@ from .const import (
     CONF_ZONE,
     CONF_MONITOR_SYSTEMWIDE,
     DEFAULT_UPDATE_INTERVAL,
+    ZONES,
     STATUS_NORMAL,
     STATUS_MLCC2,
     STATUS_OP4,
@@ -48,7 +52,16 @@ class ISONEDataCoordinator(DataUpdateCoordinator):
         # Get config values
         update_interval = entry.data.get(CONF_UPDATE_INTERVAL, DEFAULT_UPDATE_INTERVAL)
         self.zone = entry.data.get(CONF_ZONE)
+        self.zone_code = ZONES.get(self.zone) if self.zone else None
         self.monitor_systemwide = entry.data.get(CONF_MONITOR_SYSTEMWIDE, True)
+        
+        # Track last update times for CSV data
+        self.last_zone_update = None
+        self.last_capacity_update = None
+        
+        # Cached CSV data
+        self.cached_zone_load = None
+        self.cached_capacity = None
         
         super().__init__(
             hass,
@@ -58,28 +71,56 @@ class ISONEDataCoordinator(DataUpdateCoordinator):
         )
 
     async def _async_update_data(self) -> dict[str, Any]:
-        """Fetch data from ISO-NE via gridstatus."""
+        """Fetch data from ISO-NE via gridstatus and CSV."""
         try:
             data = {}
+            now = datetime.now()
             
-            # Get system status
+            # Get system status (every update - 5 min)
             _LOGGER.debug("Fetching ISO-NE system status")
             status_data = await self.hass.async_add_executor_job(
                 self._get_status
             )
             data["status"] = status_data
             
-            # Get load data
-            _LOGGER.debug("Fetching ISO-NE load data")
+            # Get total load (every update - 5 min)
+            _LOGGER.debug("Fetching ISO-NE total load")
             load_data = await self.hass.async_add_executor_job(
                 self._get_load
             )
             data["load"] = load_data
             
+            # Get zone load from CSV (every 10 min)
+            if self.zone and self.zone_code:
+                if (self.last_zone_update is None or 
+                    (now - self.last_zone_update).total_seconds() >= 600):
+                    _LOGGER.debug("Fetching zone load from CSV")
+                    zone_load = await self._get_zone_load_csv()
+                    self.cached_zone_load = zone_load
+                    self.last_zone_update = now
+                data["load"]["zone_load"] = self.cached_zone_load
+            
+            # Get capacity from CSV (every 30 min)
+            if (self.last_capacity_update is None or 
+                (now - self.last_capacity_update).total_seconds() >= 1800):
+                _LOGGER.debug("Fetching capacity from CSV")
+                capacity = await self._get_capacity_csv()
+                self.cached_capacity = capacity
+                self.last_capacity_update = now
+            data["capacity"] = self.cached_capacity
+            
+            # Calculate capacity margin
+            if data.get("capacity") and data["load"].get("total_load"):
+                margin = ((data["capacity"] - data["load"]["total_load"]) / 
+                         data["capacity"] * 100)
+                data["capacity_margin"] = round(margin, 1)
+            else:
+                data["capacity_margin"] = None
+            
             # Parse status for alerts
             data["parsed_status"] = self._parse_status(status_data)
             
-            _LOGGER.debug("Successfully updated ISO-NE data: %s", data)
+            _LOGGER.debug("Successfully updated ISO-NE data")
             return data
             
         except Exception as err:
@@ -103,7 +144,7 @@ class ISONEDataCoordinator(DataUpdateCoordinator):
             return {"status": STATUS_NORMAL, "raw": None, "error": str(err)}
 
     def _get_load(self) -> dict[str, Any]:
-        """Get current load data (runs in executor)."""
+        """Get current total load data (runs in executor)."""
         try:
             # Get today's load data
             load = self.isone.get_load("today")
@@ -117,12 +158,86 @@ class ISONEDataCoordinator(DataUpdateCoordinator):
             return {
                 "total_load": latest_load.get("Load"),
                 "timestamp": latest_load.get("Time"),
-                "zone_load": None,  # Zone-specific load requires different API call
+                "zone_load": None,  # Will be filled by CSV data
             }
             
         except Exception as err:
             _LOGGER.error("Error fetching load: %s", err)
             return {"total_load": None, "zone_load": None, "error": str(err)}
+
+    async def _get_zone_load_csv(self) -> float | None:
+        """Fetch zone load from ISO-NE CSV."""
+        try:
+            # Format: WW_RT_ACTUAL_LOADS_YYYYMMDD.csv
+            date_str = datetime.now().strftime("%Y%m%d")
+            url = f"https://www.iso-ne.com/static-transform/csv/histRpts/rt-load/WW_RT_ACTUAL_LOADS_{date_str}.csv"
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=10) as response:
+                    if response.status != 200:
+                        _LOGGER.warning(f"Failed to fetch zone load CSV: HTTP {response.status}")
+                        return None
+                    
+                    csv_text = await response.text()
+                    
+            # Parse CSV
+            df = pd.read_csv(io.StringIO(csv_text))
+            
+            # Find the column for our zone (e.g., ".H.NEWHAMPSHIRE")
+            zone_column = None
+            for col in df.columns:
+                if self.zone.upper() in col.upper():
+                    zone_column = col
+                    break
+            
+            if not zone_column:
+                _LOGGER.warning(f"Zone column not found for {self.zone}")
+                return None
+            
+            # Get most recent value
+            latest_value = df[zone_column].iloc[-1]
+            return float(latest_value) if pd.notna(latest_value) else None
+            
+        except Exception as err:
+            _LOGGER.error(f"Error fetching zone load CSV: {err}")
+            return None
+
+    async def _get_capacity_csv(self) -> float | None:
+        """Fetch system capacity from ISO-NE CSV."""
+        try:
+            url = "https://www.iso-ne.com/static-transform/csv/7daysforecast/capacities"
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=10) as response:
+                    if response.status != 200:
+                        _LOGGER.warning(f"Failed to fetch capacity CSV: HTTP {response.status}")
+                        # Return static fallback
+                        return 31500.0
+                    
+                    csv_text = await response.text()
+            
+            # Parse CSV
+            df = pd.read_csv(io.StringIO(csv_text))
+            
+            # Get today's capacity (first row is usually today)
+            # Look for "Operable Capacity" or similar column
+            capacity_col = None
+            for col in df.columns:
+                if "capacity" in col.lower() or "available" in col.lower():
+                    capacity_col = col
+                    break
+            
+            if capacity_col:
+                capacity = df[capacity_col].iloc[0]
+                return float(capacity) if pd.notna(capacity) else 31500.0
+            else:
+                # Fallback to static value
+                return 31500.0
+                
+        except Exception as err:
+            _LOGGER.error(f"Error fetching capacity CSV: {err}")
+            # Return static fallback capacity for New England
+            return 31500.0
 
     def _parse_status(self, status_data: dict[str, Any]) -> dict[str, Any]:
         """Parse status data to extract meaningful alerts."""
