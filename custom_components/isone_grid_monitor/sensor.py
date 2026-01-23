@@ -55,6 +55,7 @@ async def async_setup_entry(
         ISONEOP4ActionSensor(coordinator, entry),
         ISONESystemCapacitySensor(coordinator, entry),
         ISONECapacityMarginSensor(coordinator, entry),
+        ISONEForecastAlertsSensor(coordinator, entry),
     ]
     
     # Add zone-specific load sensor if zone is selected
@@ -410,5 +411,82 @@ class ISONEZoneLoadSensor(ISONEBaseSensor):
         load_data = self.coordinator.data.get("load", {})
         if load_data.get("timestamp"):
             attrs[ATTR_TIMESTAMP] = load_data["timestamp"]
+        
+        return attrs
+
+
+class ISONEForecastAlertsSensor(ISONEBaseSensor):
+    """Sensor for ISO-NE 7-day forecast alerts."""
+
+    _attr_name = "Forecast Alerts"
+    _attr_icon = "mdi:calendar-alert"
+
+    def __init__(
+        self,
+        coordinator: ISONEDataCoordinator,
+        entry: ConfigEntry,
+    ) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator, entry)
+        self._attr_unique_id = f"{entry.entry_id}_forecast_alerts"
+
+    @property
+    def native_value(self) -> str:
+        """Return the forecast alert status."""
+        if not self.coordinator.data:
+            return "No Data"
+        
+        forecast_data = self.coordinator.data.get("forecast_alerts", {})
+        
+        if not forecast_data or not forecast_data.get("has_alerts"):
+            return "No Alerts"
+        
+        total_alerts = forecast_data.get("total_alerts", 0)
+        alerts = forecast_data.get("alerts", [])
+        
+        if alerts:
+            # Show the nearest upcoming alert
+            nearest = alerts[0]
+            days = nearest.get("days_ahead", 0)
+            if days == 0:
+                return f"Alert Today ({total_alerts} total)"
+            elif days == 1:
+                return f"Alert Tomorrow ({total_alerts} total)"
+            else:
+                return f"Alert in {days} days ({total_alerts} total)"
+        
+        return "No Alerts"
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Return the state attributes."""
+        if not self.coordinator.data:
+            return {}
+        
+        forecast_data = self.coordinator.data.get("forecast_alerts", {})
+        
+        attrs = {
+            "has_alerts": forecast_data.get("has_alerts", False),
+            "total_alerts": forecast_data.get("total_alerts", 0),
+            "forecast_checked": forecast_data.get("forecast_checked"),
+        }
+        
+        # Add details for each day with alerts
+        alerts = forecast_data.get("alerts", [])
+        if alerts:
+            for idx, day in enumerate(alerts):
+                day_key = f"day_{idx}"
+                attrs[day_key] = {
+                    "date": day.get("date"),
+                    "days_ahead": day.get("days_ahead"),
+                    "alert_count": day.get("alert_count"),
+                    "alerts": [
+                        {
+                            "type": alert.get("type"),
+                            "message": alert.get("message")
+                        }
+                        for alert in day.get("alerts", [])
+                    ]
+                }
         
         return attrs
