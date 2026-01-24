@@ -142,7 +142,7 @@ class ISONEDataCoordinator(DataUpdateCoordinator):
         """Get current system status (runs in executor)."""
         try:
             status = self.isone.get_status("latest")
-            if status is None or status.empty:
+            if status is None or (hasattr(status, "empty") and status.empty) or len(status) == 0:
                 _LOGGER.warning("No status data returned from ISO-NE")
                 return {"status": STATUS_NORMAL, "raw": None}
             
@@ -159,7 +159,7 @@ class ISONEDataCoordinator(DataUpdateCoordinator):
         try:
             # Get today's load data
             load = self.isone.get_load("today")
-            if load is None or load.empty:
+            if load is None or (hasattr(load, "empty") and load.empty) or len(load) == 0:
                 _LOGGER.warning("No load data returned from ISO-NE")
                 return {"total_load": None, "zone_load": None}
             
