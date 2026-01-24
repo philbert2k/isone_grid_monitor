@@ -334,7 +334,7 @@ class ISONEDataCoordinator(DataUpdateCoordinator):
             
         except Exception as err:
             _LOGGER.error(f"Error fetching forecast alerts: {err}")
-            return {"alerts": [], "has_alerts": False, "error": str(err)}
+            return {"alerts": [], "has_alerts": False, "error": str(err), "forecast_checked": datetime.now().isoformat()}
 
     def _parse_status(self, status_data: dict[str, Any]) -> dict[str, Any]:
         """Parse status data to extract meaningful alerts."""
