@@ -216,7 +216,7 @@ class ISONEDataCoordinator(DataUpdateCoordinator):
     async def _get_capacity_csv(self) -> float | None:
         """Fetch system capacity from ISO-NE CSV."""
         try:
-            url = "https://www.iso-ne.com/static-transform/csv/7daysforecast/capacities"
+            url = f"https://www.iso-ne.com/transform/csv/sdf?start={datetime.now().strftime('%Y%m%d')}"
             
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, timeout=10) as response:
@@ -253,77 +253,111 @@ class ISONEDataCoordinator(DataUpdateCoordinator):
     async def _get_forecast_alerts_csv(self) -> dict[str, Any]:
         """Fetch 7-day capacity forecast and parse for alerts."""
         try:
-            url = "https://www.iso-ne.com/static-transform/csv/7daysforecast/capacities"
+            # Use the correct ISO-NE forecast URL with today's date
+            date_str = datetime.now().strftime("%Y%m%d")
+            url = f"https://www.iso-ne.com/transform/csv/sdf?start={date_str}"
             
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, timeout=10) as response:
                     if response.status != 200:
                         _LOGGER.warning(f"Failed to fetch forecast CSV: HTTP {response.status}")
-                        return {"alerts": [], "has_alerts": False}
+                        return {
+                            "alerts": [], 
+                            "has_alerts": False, 
+                            "forecast_checked": datetime.now().isoformat()
+                        }
                     
                     csv_text = await response.text()
             
-            # Parse CSV
-            df = pd.read_csv(io.StringIO(csv_text))
+            # Parse the CSV data
+            lines = csv_text.split('
+')
+            data = {}
+            days = []
             
+            for line in lines:
+                if not line.strip():
+                    continue
+                
+                # Parse CSV line (handle quoted values)
+                import re as regex
+                parts = [p.strip('"') for p in regex.split(',(?=(?:[^"]*"[^"]*")*[^"]*$)', line)]
+                
+                if not parts:
+                    continue
+                
+                line_type = parts[0]
+                
+                if line_type == "H" and len(parts) > 2:
+                    # Header row with day labels
+                    days = parts[2:]
+                
+                elif line_type == "D" and len(parts) > 1:
+                    # Data row
+                    label = parts[1]
+                    values = parts[2:] if len(parts) > 2 else []
+                    if label and values:
+                        data[label] = values
+            
+            # Analyze for capacity issues
             alerts = []
             
-            # Look for columns indicating issues
-            alert_keywords = ["action", "alert", "deficiency", "relief", "op-4", "op4", 
-                            "warning", "watch", "emergency", "eea", "notice"]
-            
-            # Check each row (each day in forecast)
-            for idx, row in df.iterrows():
-                day_alerts = []
+            # Check capacity margins
+            if "Total Capacity Supply Obligation (CSO)" in data and "Total Available Generation and Imports" in data:
+                cso = data["Total Capacity Supply Obligation (CSO)"]
+                available = data["Total Available Generation and Imports"]
                 
-                # Check if there's a date column
-                date_col = None
-                for col in df.columns:
-                    if "date" in col.lower() or "day" in col.lower():
-                        date_col = col
-                        break
-                
-                forecast_date = row.get(date_col) if date_col else f"Day {idx}"
-                
-                # Scan all columns for alert keywords
-                for col in df.columns:
-                    if col == date_col:
-                        continue
-                    
-                    cell_value = str(row[col]).lower()
-                    
-                    # Check for alert keywords
-                    for keyword in alert_keywords:
-                        if keyword in cell_value and cell_value != "nan" and len(cell_value) > 3:
-                            day_alerts.append({
-                                "type": col,
-                                "message": str(row[col]),
-                                "keyword": keyword
-                            })
-                            break  # Only add once per column
-                
-                # Check for low reserve margins (capacity warnings)
-                for col in df.columns:
-                    if "margin" in col.lower() or "reserve" in col.lower():
+                for i, day in enumerate(days):
+                    if i < len(cso) and i < len(available):
                         try:
-                            value = float(row[col])
-                            # If reserve margin below 10%, flag it
-                            if value < 10 and value > 0:
-                                day_alerts.append({
-                                    "type": "Low Reserve Margin",
-                                    "message": f"Reserve margin: {value}%",
-                                    "keyword": "margin"
+                            cso_val = float(cso[i].replace(',', ''))
+                            avail_val = float(available[i].replace(',', ''))
+                            margin = ((avail_val - cso_val) / cso_val * 100)
+                            
+                            if margin < 5:
+                                alerts.append({
+                                    "date": day,
+                                    "days_ahead": i,
+                                    "alerts": [{
+                                        "type": "Critical Reserve Margin" if margin < 0 else "Low Reserve Margin",
+                                        "message": f"Reserve margin: {margin:.1f}% (Available: {avail_val:,.0f} MW, Required: {cso_val:,.0f} MW)",
+                                        "keyword": "capacity"
+                                    }],
+                                    "alert_count": 1
                                 })
-                        except (ValueError, TypeError):
+                        except (ValueError, IndexError):
                             pass
-                
-                if day_alerts:
-                    alerts.append({
-                        "date": str(forecast_date),
-                        "days_ahead": int(idx),
-                        "alerts": day_alerts,
-                        "alert_count": len(day_alerts)
-                    })
+            
+            # Check for high cold weather outages
+            if "Anticipated Cold Weather Outages" in data:
+                outages = data["Anticipated Cold Weather Outages"]
+                for i, day in enumerate(days):
+                    if i < len(outages):
+                        try:
+                            outage_val = float(outages[i].replace(',', ''))
+                            if outage_val > 3000:
+                                # Find existing alert for this day or create new
+                                day_alert = next((a for a in alerts if a["days_ahead"] == i), None)
+                                if day_alert:
+                                    day_alert["alerts"].append({
+                                        "type": "High Cold Weather Outages",
+                                        "message": f"{outage_val:,.0f} MW offline due to cold weather",
+                                        "keyword": "outage"
+                                    })
+                                    day_alert["alert_count"] += 1
+                                else:
+                                    alerts.append({
+                                        "date": day,
+                                        "days_ahead": i,
+                                        "alerts": [{
+                                            "type": "High Cold Weather Outages",
+                                            "message": f"{outage_val:,.0f} MW offline due to cold weather",
+                                            "keyword": "outage"
+                                        }],
+                                        "alert_count": 1
+                                    })
+                        except (ValueError, IndexError):
+                            pass
             
             return {
                 "alerts": alerts,
@@ -334,7 +368,12 @@ class ISONEDataCoordinator(DataUpdateCoordinator):
             
         except Exception as err:
             _LOGGER.error(f"Error fetching forecast alerts: {err}")
-            return {"alerts": [], "has_alerts": False, "error": str(err), "forecast_checked": datetime.now().isoformat()}
+            return {
+                "alerts": [], 
+                "has_alerts": False, 
+                "error": str(err), 
+                "forecast_checked": datetime.now().isoformat()
+            }
 
     def _parse_status(self, status_data: dict[str, Any]) -> dict[str, Any]:
         """Parse status data to extract meaningful alerts."""
