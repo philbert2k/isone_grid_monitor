@@ -7,6 +7,7 @@ from typing import Any
 import aiohttp
 import pandas as pd
 import io
+import re
 
 import gridstatus
 from gridstatus import ISONE
@@ -78,11 +79,9 @@ class ISONEDataCoordinator(DataUpdateCoordinator):
             data = {}
             now = datetime.now()
             
-            # Get system status (every update - 5 min)
-            _LOGGER.debug("Fetching ISO-NE system status")
-            status_data = await self.hass.async_add_executor_job(
-                self._get_status
-            )
+            # Get system status via HTML scraping (more reliable than API)
+            _LOGGER.debug("Fetching ISO-NE system status from website")
+            status_data = await self._get_status_from_web()
             data["status"] = status_data
             
             # Get total load (every update - 5 min)
@@ -138,21 +137,92 @@ class ISONEDataCoordinator(DataUpdateCoordinator):
             _LOGGER.error("Error fetching ISO-NE data: %s", err)
             raise UpdateFailed(f"Error communicating with ISO-NE API: {err}") from err
 
-    def _get_status(self) -> dict[str, Any]:
-        """Get current system status (runs in executor)."""
+    async def _get_status_from_web(self) -> dict[str, Any]:
+        """Get current system status by scraping ISO-NE website (PRIMARY METHOD)."""
+        try:
+            url = "https://www.iso-ne.com/markets-operations/system-forecast-status/current-system-status/"
+            
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=10) as response:
+                    if response.status != 200:
+                        _LOGGER.warning(f"Web scraping failed with HTTP {response.status}, falling back to gridstatus API")
+                        return await self.hass.async_add_executor_job(self._get_status_from_api)
+                    
+                    html = await response.text()
+            
+            # Parse HTML with BeautifulSoup
+            try:
+                from bs4 import BeautifulSoup
+            except ImportError:
+                _LOGGER.error("BeautifulSoup not available, falling back to gridstatus API")
+                return await self.hass.async_add_executor_job(self._get_status_from_api)
+            
+            soup = BeautifulSoup(html, 'html.parser')
+            
+            # Find the status table
+            tables = soup.find_all('table')
+            if not tables:
+                _LOGGER.warning("No status table found on webpage, falling back to gridstatus API")
+                return await self.hass.async_add_executor_job(self._get_status_from_api)
+            
+            # Get the second row (first data row with actual status)
+            rows = tables[0].find_all('tr')
+            if len(rows) < 2:
+                _LOGGER.warning("Status table has insufficient rows, falling back to gridstatus API")
+                return await self.hass.async_add_executor_job(self._get_status_from_api)
+            
+            cells = rows[1].find_all(['td', 'th'])
+            if len(cells) < 2:
+                _LOGGER.warning("Status table has insufficient cells, falling back to gridstatus API")
+                return await self.hass.async_add_executor_job(self._get_status_from_api)
+            
+            # Extract status from second cell
+            status_text = cells[1].get_text(strip=True)
+            
+            # Clean up status text (remove the long description)
+            if "ISO New England" in status_text:
+                status_text = status_text.split("ISO New England")[0].strip()
+            
+            _LOGGER.info(f"✅ Status obtained via WEB SCRAPING: {status_text}")
+            
+            return {
+                "status": status_text,
+                "source": "web_scrape",
+                "raw": status_text
+            }
+            
+        except Exception as err:
+            _LOGGER.error(f"Error scraping web status: {err}, falling back to gridstatus API")
+            return await self.hass.async_add_executor_job(self._get_status_from_api)
+
+    def _get_status_from_api(self) -> dict[str, Any]:
+        """Get current system status from gridstatus API (FALLBACK METHOD)."""
         try:
             status = self.isone.get_status("latest")
             if status is None or (hasattr(status, "empty") and status.empty) or len(status) == 0:
-                _LOGGER.warning("No status data returned from ISO-NE")
-                return {"status": STATUS_NORMAL, "raw": None}
+                _LOGGER.warning("⚠️  No status data returned from gridstatus API")
+                return {"status": STATUS_NORMAL, "source": "api_empty", "raw": None}
             
             # Convert DataFrame to dict for easier handling
-            status_dict = status.to_dict('records')[0] if not status.empty else {}
-            return {"status": status_dict.get("Status", STATUS_NORMAL), "raw": status_dict}
+            status_dict = status.to_dict('records')[0] if len(status) > 0 else {}
+            status_text = status_dict.get("Status", STATUS_NORMAL)
+            
+            _LOGGER.info(f"⚠️  Status obtained via GRIDSTATUS API (fallback): {status_text}")
+            
+            return {
+                "status": status_text,
+                "source": "api_gridstatus",
+                "raw": status_dict
+            }
             
         except Exception as err:
-            _LOGGER.error("Error fetching status: %s", err)
-            return {"status": STATUS_NORMAL, "raw": None, "error": str(err)}
+            _LOGGER.error(f"❌ Error fetching status from gridstatus API: {err}")
+            return {
+                "status": STATUS_NORMAL,
+                "source": "api_error",
+                "raw": None,
+                "error": str(err)
+            }
 
     def _get_load(self) -> dict[str, Any]:
         """Get current total load data (runs in executor)."""
@@ -173,7 +243,7 @@ class ISONEDataCoordinator(DataUpdateCoordinator):
             }
             
         except Exception as err:
-            _LOGGER.error("Error fetching load: %s", err)
+            _LOGGER.error(f"Error fetching load: {err}")
             return {"total_load": None, "zone_load": None, "error": str(err)}
 
     async def _get_zone_load_csv(self) -> float | None:
@@ -216,44 +286,49 @@ class ISONEDataCoordinator(DataUpdateCoordinator):
     async def _get_capacity_csv(self) -> float | None:
         """Fetch system capacity from ISO-NE CSV."""
         try:
-            url = f"https://www.iso-ne.com/transform/csv/sdf?start={datetime.now().strftime('%Y%m%d')}"
+            date_str = datetime.now().strftime("%Y%m%d")
+            url = f"https://www.iso-ne.com/transform/csv/sdf?start={date_str}"
             
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, timeout=10) as response:
                     if response.status != 200:
                         _LOGGER.warning(f"Failed to fetch capacity CSV: HTTP {response.status}")
-                        # Return static fallback
                         return 31500.0
                     
                     csv_text = await response.text()
             
-            # Parse CSV
-            df = pd.read_csv(io.StringIO(csv_text))
+            # Parse the CSV data
+            lines = csv_text.split('\n')
+            data = {}
             
-            # Get today's capacity (first row is usually today)
-            # Look for "Operable Capacity" or similar column
-            capacity_col = None
-            for col in df.columns:
-                if "capacity" in col.lower() or "available" in col.lower():
-                    capacity_col = col
-                    break
+            for line in lines:
+                if not line.strip():
+                    continue
+                
+                # Parse CSV line (handle quoted values)
+                parts = [p.strip('"') for p in re.split(',(?=(?:[^"]*"[^"]*")*[^"]*$)', line)]
+                
+                if len(parts) > 1 and parts[0] == "D":
+                    label = parts[1]
+                    values = parts[2:] if len(parts) > 2 else []
+                    if label and values and "Total Available Generation and Imports" in label:
+                        try:
+                            # Get first day's capacity
+                            capacity = float(values[0].replace(',', ''))
+                            return capacity
+                        except (ValueError, IndexError):
+                            pass
             
-            if capacity_col:
-                capacity = df[capacity_col].iloc[0]
-                return float(capacity) if pd.notna(capacity) else 31500.0
-            else:
-                # Fallback to static value
-                return 31500.0
+            # Fallback to static value if not found
+            return 31500.0
                 
         except Exception as err:
             _LOGGER.error(f"Error fetching capacity CSV: {err}")
-            # Return static fallback capacity for New England
             return 31500.0
 
     async def _get_forecast_alerts_csv(self) -> dict[str, Any]:
         """Fetch 7-day capacity forecast and parse for alerts."""
         try:
-            # Use the correct ISO-NE forecast URL with today's date
             date_str = datetime.now().strftime("%Y%m%d")
             url = f"https://www.iso-ne.com/transform/csv/sdf?start={date_str}"
             
@@ -262,8 +337,8 @@ class ISONEDataCoordinator(DataUpdateCoordinator):
                     if response.status != 200:
                         _LOGGER.warning(f"Failed to fetch forecast CSV: HTTP {response.status}")
                         return {
-                            "alerts": [], 
-                            "has_alerts": False, 
+                            "alerts": [],
+                            "has_alerts": False,
                             "forecast_checked": datetime.now().isoformat()
                         }
                     
@@ -279,8 +354,7 @@ class ISONEDataCoordinator(DataUpdateCoordinator):
                     continue
                 
                 # Parse CSV line (handle quoted values)
-                import re as regex
-                parts = [p.strip('"') for p in regex.split(',(?=(?:[^"]*"[^"]*")*[^"]*$)', line)]
+                parts = [p.strip('"') for p in re.split(',(?=(?:[^"]*"[^"]*")*[^"]*$)', line)]
                 
                 if not parts:
                     continue
@@ -288,11 +362,9 @@ class ISONEDataCoordinator(DataUpdateCoordinator):
                 line_type = parts[0]
                 
                 if line_type == "H" and len(parts) > 2:
-                    # Header row with day labels
                     days = parts[2:]
                 
                 elif line_type == "D" and len(parts) > 1:
-                    # Data row
                     label = parts[1]
                     values = parts[2:] if len(parts) > 2 else []
                     if label and values:
@@ -335,7 +407,6 @@ class ISONEDataCoordinator(DataUpdateCoordinator):
                         try:
                             outage_val = float(outages[i].replace(',', ''))
                             if outage_val > 3000:
-                                # Find existing alert for this day or create new
                                 day_alert = next((a for a in alerts if a["days_ahead"] == i), None)
                                 if day_alert:
                                     day_alert["alerts"].append({
@@ -368,15 +439,16 @@ class ISONEDataCoordinator(DataUpdateCoordinator):
         except Exception as err:
             _LOGGER.error(f"Error fetching forecast alerts: {err}")
             return {
-                "alerts": [], 
-                "has_alerts": False, 
-                "error": str(err), 
+                "alerts": [],
+                "has_alerts": False,
+                "error": str(err),
                 "forecast_checked": datetime.now().isoformat()
             }
 
     def _parse_status(self, status_data: dict[str, Any]) -> dict[str, Any]:
         """Parse status data to extract meaningful alerts."""
         status_text = status_data.get("status", STATUS_NORMAL)
+        source = status_data.get("source", "unknown")
         raw_data = status_data.get("raw", {})
         
         parsed = {
@@ -386,6 +458,7 @@ class ISONEDataCoordinator(DataUpdateCoordinator):
             "eea_level": None,
             "description": "Grid operating normally",
             "is_emergency": False,
+            "data_source": source,  # Track where status came from
         }
         
         # Normalize status text for parsing
@@ -421,7 +494,6 @@ class ISONEDataCoordinator(DataUpdateCoordinator):
                 
         # Check for OP-4 actions
         elif "op-4" in status_lower or "op4" in status_lower:
-            # Try to extract action number
             action_num = self._extract_op4_action(status_text)
             parsed["status"] = STATUS_OP4
             parsed["op4_action"] = action_num
@@ -469,9 +541,6 @@ class ISONEDataCoordinator(DataUpdateCoordinator):
 
     def _extract_op4_action(self, status_text: str) -> int | None:
         """Extract OP-4 action number from status text."""
-        import re
-        
-        # Look for patterns like "Action 5", "OP-4 Action 10", etc.
         patterns = [
             r"action\s+(\d+)",
             r"op-?4\s+action\s+(\d+)",
