@@ -271,7 +271,6 @@ class ISONEDataCoordinator(DataUpdateCoordinator):
             
             # Parse the CSV data
             lines = csv_text.split('\n')
-')
             data = {}
             days = []
             
