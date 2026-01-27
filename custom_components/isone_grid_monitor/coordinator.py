@@ -270,7 +270,7 @@ class ISONEDataCoordinator(DataUpdateCoordinator):
                     csv_text = await response.text()
             
             # Parse the CSV data
-            lines = csv_text.split('
+            lines = csv_text.split('\n')
 ')
             data = {}
             days = []
