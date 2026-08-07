@@ -386,8 +386,11 @@ class ISONEDataCoordinator(DataUpdateCoordinator):
                             margin = ((avail_val - cso_val) / cso_val * 100)
                             
                             if margin < 5:
+                                calendar_dt = datetime.now() + timedelta(days=i + 1)
                                 alerts.append({
                                     "date": day,
+                                    "calendar_date": calendar_dt.strftime("%Y-%m-%d"),
+                                    "weekday": calendar_dt.strftime("%a"),
                                     "days_ahead": i,
                                     "alerts": [{
                                         "type": "Critical Reserve Margin" if margin < 0 else "Low Reserve Margin",
@@ -416,8 +419,11 @@ class ISONEDataCoordinator(DataUpdateCoordinator):
                                     })
                                     day_alert["alert_count"] += 1
                                 else:
+                                    calendar_dt = datetime.now() + timedelta(days=i + 1)
                                     alerts.append({
                                         "date": day,
+                                        "calendar_date": calendar_dt.strftime("%Y-%m-%d"),
+                                        "weekday": calendar_dt.strftime("%a"),
                                         "days_ahead": i,
                                         "alerts": [{
                                             "type": "High Cold Weather Outages",
