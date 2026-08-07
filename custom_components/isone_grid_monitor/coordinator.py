@@ -284,54 +284,112 @@ class ISONEDataCoordinator(DataUpdateCoordinator):
             return None
 
     async def _get_capacity_csv(self) -> float | None:
-        """Fetch system capacity from ISO-NE CSV."""
+        """Fetch LIVE system capacity from ISO-NE Morning Report (not the 7-day forecast).
+
+        The Morning Report reflects TODAY's actual capacity position and is published
+        once daily (~8am ET). It self-resolves to the latest report even if the start
+        date doesn't match, but we still validate the report date defensively and fall
+        back to the last known good value if anything looks stale or fails to parse.
+        """
+        fallback = self.cached_capacity
         try:
             date_str = datetime.now().strftime("%Y%m%d")
-            url = f"https://www.iso-ne.com/transform/csv/sdf?start={date_str}"
-            
+            url = f"https://www.iso-ne.com/transform/csv/morningreport?start={date_str}"
+
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, timeout=10) as response:
                     if response.status != 200:
-                        _LOGGER.warning(f"Failed to fetch capacity CSV: HTTP {response.status}")
-                        return 31500.0
-                    
+                        _LOGGER.warning(f"Morning Report fetch failed: HTTP {response.status}, using last known capacity ({fallback})")
+                        return fallback
+
                     csv_text = await response.text()
-            
-            # Parse the CSV data
+
             lines = csv_text.split('\n')
-            data = {}
-            
+
+            # Validate the report is for today (or at worst yesterday, before today's ~8am publish)
+            report_date = None
+            for line in lines:
+                if line.startswith('"C","Report for'):
+                    parts = [p.strip('"') for p in line.split(',', 1)]
+                    try:
+                        date_part = parts[1].replace("Report for ", "").strip()
+                        report_date = datetime.strptime(date_part, "%m/%d/%Y").date()
+                    except (ValueError, IndexError):
+                        pass
+                    break
+
+            today = datetime.now().date()
+            if report_date is not None:
+                days_old = (today - report_date).days
+                if days_old > 1:
+                    _LOGGER.warning(
+                        f"Morning Report is {days_old} days old (report date {report_date}, today {today}) - "
+                        f"treating as stale, using last known capacity ({fallback})"
+                    )
+                    return fallback
+            else:
+                _LOGGER.warning("Could not validate Morning Report date - proceeding cautiously")
+
+            # Parse for "H. Total Available Capacity"
             for line in lines:
                 if not line.strip():
                     continue
-                
-                # Parse CSV line (handle quoted values)
                 parts = [p.strip('"') for p in re.split(',(?=(?:[^"]*"[^"]*")*[^"]*$)', line)]
-                
-                if len(parts) > 1 and parts[0] == "D":
-                    label = parts[1]
-                    values = parts[2:] if len(parts) > 2 else []
-                    if label and values and "Total Available Generation and Imports" in label:
-                        try:
-                            # Get first day's capacity
-                            capacity = float(values[0].replace(',', ''))
-                            return capacity
-                        except (ValueError, IndexError):
-                            pass
-            
-            # Fallback to static value if not found
-            return 31500.0
-                
-        except Exception as err:
-            _LOGGER.error(f"Error fetching capacity CSV: {err}")
-            return 31500.0
+                if len(parts) > 2 and parts[0] == "D" and "Total Available Capacity" in parts[1]:
+                    try:
+                        capacity = float(parts[2].replace(',', ''))
+                        _LOGGER.info(f"✅ Live capacity from Morning Report ({report_date}): {capacity:,.0f} MW")
+                        return capacity
+                    except (ValueError, IndexError):
+                        pass
 
+            _LOGGER.warning("Could not find 'Total Available Capacity' row in Morning Report, using last known capacity")
+            return fallback
+
+        except Exception as err:
+            _LOGGER.error(f"Error fetching Morning Report capacity: {err}, using last known capacity ({fallback})")
+            return fallback
+
+    async def _get_current_forecast_csv_url(self) -> str | None:
+        """Scrape the seven-day-forecast page for the current, correctly-versioned CSV link.
+
+        The /transform/csv/sdf endpoint can return stale cached data (confirmed: requesting
+        a mismatched start date once returned a report from July 2025) unless called with
+        the exact start+version pair the site currently has live. That pair is embedded in
+        the page's 'download a CSV file' link, so we grab it from there first.
+        """
+        try:
+            page_url = "https://www.iso-ne.com/markets-operations/system-forecast-status/seven-day-capacity-forecast"
+            async with aiohttp.ClientSession() as session:
+                async with session.get(page_url, timeout=10) as response:
+                    if response.status != 200:
+                        _LOGGER.warning(f"Could not fetch forecast page to find current CSV version: HTTP {response.status}")
+                        return None
+                    html = await response.text()
+
+            match = re.search(r'/transform/csv/sdf\?start=\d{8}&version=\d+', html)
+            if match:
+                csv_url = f"https://www.iso-ne.com{match.group(0)}"
+                _LOGGER.debug(f"Found current forecast CSV URL: {csv_url}")
+                return csv_url
+
+            _LOGGER.warning("Could not find versioned CSV link on forecast page")
+            return None
+
+        except Exception as err:
+            _LOGGER.error(f"Error scraping forecast page for CSV version: {err}")
+            return None
     async def _get_forecast_alerts_csv(self) -> dict[str, Any]:
         """Fetch 7-day capacity forecast and parse for alerts."""
         try:
-            date_str = datetime.now().strftime("%Y%m%d")
-            url = f"https://www.iso-ne.com/transform/csv/sdf?start={date_str}"
-            
+            # Get the current, correctly-versioned CSV URL by scraping the forecast page first.
+            # Guessing start=today without a matching version can return stale cached data.
+            url = await self._get_current_forecast_csv_url()
+            if not url:
+                date_str = datetime.now().strftime("%Y%m%d")
+                url = f"https://www.iso-ne.com/transform/csv/sdf?start={date_str}"
+                _LOGGER.warning(f"Falling back to unversioned forecast URL (may return stale data): {url}")
+
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, timeout=10) as response:
                     if response.status != 200:
